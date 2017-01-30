@@ -266,6 +266,7 @@ typedef struct pgbuf_holder_set PGBUF_HOLDER_SET;
 typedef struct pgbuf_bcb PGBUF_BCB;
 typedef struct pgbuf_iopage_buffer PGBUF_IOPAGE_BUFFER;
 typedef struct pgbuf_aout_buf PGBUF_AOUT_BUF;
+typedef struct pgbuf_aout_ht_list PGBUF_AOUT_HT_LIST;
 
 typedef struct pgbuf_buffer_lock PGBUF_BUFFER_LOCK;
 typedef struct pgbuf_buffer_hash PGBUF_BUFFER_HASH;
@@ -377,6 +378,7 @@ struct pgbuf_bcb
 
   volatile LOG_LSA oldest_unflush_lsa;	/* The oldest LSA record of the page that has not been written to disk */
   PGBUF_IOPAGE_BUFFER *iopage_buffer;	/* pointer to iopage buffer structure */
+  int list_id;				/* ID of the (list, hash) pair in AOUT to which this VPID belongs */
 };
 
 /* iopage buffer structure */
@@ -457,25 +459,37 @@ struct pgbuf_aout_buf
   VPID vpid;			/* page VPID */
   PGBUF_AOUT_BUF *next;		/* next element in list */
   PGBUF_AOUT_BUF *prev;		/* prev element in list */
+  UINT64 timestamp;		/* counter that tells when the VPID was inserted in one of the AOUT
+				  * lists */
 };
+
+struct pgbuf_aout_ht_list {
+#if defined(SERVER_MODE)
+  pthread_mutex_t list_mutex;	/* list mutex for the integrity of Aout list. */
+#endif
+  MHT_TABLE* table; // hash table associated with this aout list which maps
+		    // a VPID to an address in the aout list
+  PGBUF_AOUT_BUF *Aout_top;	/* top of the queue */
+  PGBUF_AOUT_BUF *Aout_bottom;	/* bottom of the queue */
+  PGBUF_AOUT_BUF* free_list;	/* a free list of aout nodes */
+};
+
 
 /* Aout list */
 struct pgbuf_aout_list
 {
-#if defined(SERVER_MODE)
-  pthread_mutex_t Aout_mutex;	/* Aout mutex for the integrity of Aout list. */
-#endif				/* SERVER_MODE */
-  PGBUF_AOUT_BUF *Aout_top;	/* top of the queue */
-  PGBUF_AOUT_BUF *Aout_bottom;	/* bottom of the queue */
+  PGBUF_AOUT_HT_LIST* aout_lists; // array of hash table, aout lists
 
-  PGBUF_AOUT_BUF *Aout_free;	/* a free list of Aout nodes */
-
-  PGBUF_AOUT_BUF *bufarray;	/* Array holding all the nodes in the list. Since Aout has a predefined fixed size, it
+  PGBUF_AOUT_BUF *bufarray;	/* Array holding all the nodes in the lists. Since Aout has a predefined fixed size, it
 				 * makes more sense to preallocate all the nodes */
-  int num_hashes;		/* number of hash tables */
-  MHT_TABLE **aout_buf_ht;	/* hash table for fast history lookup. */
 
-  int max_count;		/* maximum size of the Aout queue */
+  int num_lists;		/* number of AOUT lists */
+  
+  int max_count;		/* maximum number of vpids that AOUT can contain */
+  
+  UINT64 minim;			/* current minimum timestamp in all the AOUT lists */
+  int id_minim;			/* index of the aout list that contains the minimum timestamp */
+  UINT64 cur_timestamp;		/* maximum value of all the timestamps in the aout lists */
 };
 
 /* Ain list */
@@ -657,7 +671,7 @@ static char pgbuf_Guard[8] = { MEM_REGION_GUARD_MARK, MEM_REGION_GUARD_MARK, MEM
 static PGBUF_PS_INFO ps_info;
 #endif /* PAGE_STATISTICS */
 
-#define AOUT_HASH_DIVIDE_RATIO 1000
+#define AOUT_PARTITION_DIVIDE_RATIO 1000
 #define AOUT_HASH_IDX(vpid, list) ((vpid)->pageid % list->num_hashes)
 
 /* Set buffer dirty flag & update dirties count. */
@@ -741,8 +755,8 @@ static int pgbuf_get_victim_candidates_from_lru (int check_count, int victim_cou
 static PGBUF_BCB *pgbuf_get_victim (THREAD_ENTRY * thread_p, const VPID * vpid, int max_count);
 static PGBUF_BCB *pgbuf_get_victim_from_ain_list (THREAD_ENTRY * thread_p, int max_count);
 static PGBUF_BCB *pgbuf_get_victim_from_lru_list (THREAD_ENTRY * thread_p, const VPID * vpid, int max_count);
-static void pgbuf_add_vpid_to_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid);
-static bool pgbuf_remove_vpid_from_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid);
+static int pgbuf_add_vpid_to_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid);
+static bool pgbuf_remove_vpid_from_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid, const int list_id);
 static int pgbuf_invalidate_bcb_from_lru (PGBUF_BCB * bufptr);
 static int pgbuf_invalidate_bcb_from_ain (PGBUF_BCB * bufptr);
 static int pgbuf_relocate_top_lru (PGBUF_BCB * bufptr, int dest_zone);
@@ -1136,24 +1150,21 @@ pgbuf_finalize (void)
       free_and_init (pgbuf_Pool.buf_AOUT_list.bufarray);
     }
 
-  if (pgbuf_Pool.buf_AOUT_list.aout_buf_ht != NULL)
+  if (pgbuf_Pool.buf_AOUT_list.aout_lists != NULL)
     {
-      for (i = 0; i < pgbuf_Pool.buf_AOUT_list.num_hashes; i++)
+      for (i = 0; i < pgbuf_Pool.buf_AOUT_list.num_lists; i++)
 	{
-	  mht_destroy (pgbuf_Pool.buf_AOUT_list.aout_buf_ht[i]);
+	  mht_destroy (pgbuf_Pool.buf_AOUT_list.aout_lists[i].table);
+	  pthread_mutex_destroy (&pgbuf_Pool.buf_AOUT_list.aout_lists[i].list_mutex);
+	  pgbuf_Pool.buf_AOUT_list.aout_lists[i].free_list = NULL;
+	  pgbuf_Pool.buf_AOUT_list.aout_lists[i].Aout_bottom = NULL;
+	  pgbuf_Pool.buf_AOUT_list.aout_lists[i].Aout_top = NULL;
 	}
-      free_and_init (pgbuf_Pool.buf_AOUT_list.aout_buf_ht);
-
-      pgbuf_Pool.buf_AOUT_list.num_hashes = 0;
+      free_and_init (pgbuf_Pool.buf_AOUT_list.aout_lists);
+      pgbuf_Pool.buf_AOUT_list.num_lists = 0;
     }
 
-
-  pthread_mutex_destroy (&pgbuf_Pool.buf_AOUT_list.Aout_mutex);
-
-  pgbuf_Pool.buf_AOUT_list.aout_buf_ht = NULL;
-  pgbuf_Pool.buf_AOUT_list.Aout_bottom = NULL;
-  pgbuf_Pool.buf_AOUT_list.Aout_top = NULL;
-  pgbuf_Pool.buf_AOUT_list.Aout_free = NULL;
+  pgbuf_Pool.buf_AOUT_list.aout_lists = NULL;
   pgbuf_Pool.buf_AOUT_list.max_count = 0;
 
   if (pgbuf_Pool.seq_chkpt_flusher.flush_list != NULL)
@@ -4949,7 +4960,7 @@ pgbuf_initialize_aout_list (void)
 {
 /* limit Aout size to equivalent of 512M */
 #define PGBUF_LIMIT_AOUT_BUFFERS 32768
-  int i;
+  int i, j, remainder, distribute_remainder, remainder_lists, prev, inc, partition_size;
   float aout_ratio;
   size_t alloc_size = 0;
   PGBUF_AOUT_LIST *list = &pgbuf_Pool.buf_AOUT_list;
@@ -4957,13 +4968,11 @@ pgbuf_initialize_aout_list (void)
   aout_ratio = prm_get_float_value (PRM_ID_PB_AOUT_RATIO);
 
   list->max_count = (int) (pgbuf_Pool.num_buffers * aout_ratio);
-  list->Aout_top = NULL;
-  list->Aout_bottom = NULL;
   list->bufarray = NULL;
-  list->aout_buf_ht = NULL;
-
-  pthread_mutex_init (&list->Aout_mutex, NULL);
-
+  list->minim = 0;
+  list->id_minim = 0;
+  list->cur_timestamp = 0;
+  
   if (aout_ratio <= 0)
     {
       /* not using Aout list */
@@ -4981,63 +4990,84 @@ pgbuf_initialize_aout_list (void)
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
 
-  list->Aout_free = &list->bufarray[0];
-
-  for (i = 0; i < list->max_count; i++)
-    {
-      VPID_SET_NULL (&list->bufarray[i].vpid);
-      if (i != list->max_count - 1)
-	{
-	  list->bufarray[i].next = &list->bufarray[i + 1];
-	}
-      else
-	{
-	  list->bufarray[i].next = NULL;
-	}
-      list->bufarray[i].prev = NULL;
-    }
-
-  list->num_hashes = MAX (list->max_count / AOUT_HASH_DIVIDE_RATIO, 1);
-
-  alloc_size = list->num_hashes * sizeof (MHT_TABLE *);
-  list->aout_buf_ht = malloc (alloc_size);
-  if (list->aout_buf_ht == NULL)
+  list->num_lists = MAX (list->max_count / AOUT_PARTITION_DIVIDE_RATIO, 1);
+  alloc_size = list->num_lists * sizeof (PGBUF_AOUT_HT_LIST);
+  list->aout_lists = (PGBUF_AOUT_HT_LIST *) malloc (alloc_size);
+  if (list->aout_lists == NULL)
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, alloc_size);
       goto error_return;
     }
 
-  memset (list->aout_buf_ht, 0, alloc_size);
-
-  for (i = 0; i < list->num_hashes; i++)
+  remainder = list->max_count % AOUT_PARTITION_DIVIDE_RATIO;
+  distribute_remainder = remainder / list->num_lists;
+  remainder_lists = remainder % list->num_lists;
+  prev = 0;
+  inc = 0;
+  partition_size = AOUT_PARTITION_DIVIDE_RATIO;
+  if(list->max_count < AOUT_PARTITION_DIVIDE_RATIO)
     {
-      list->aout_buf_ht[i] = mht_create ("PGBUF_AOUT_HASH", list->max_count, pgbuf_hash_vpid, pgbuf_compare_vpid);
+      partition_size = 0;
+    }
 
-      if (list->aout_buf_ht[i] == NULL)
+  for (i = 0; i < list->num_lists;++i)
+    {
+      if(i < remainder_lists)
+	{
+	  ++inc;
+	}
+
+      for(j = prev;j < prev + partition_size + distribute_remainder + inc;j++)
+	{
+	  VPID_SET_NULL (&list->bufarray[j].vpid);
+	  if (j != prev + partition_size + distribute_remainder + inc - 1)
+	    {
+	      list->bufarray[j].next = &list->bufarray[j + 1];
+	    }
+	  else
+	    {
+	      list->bufarray[j].next = NULL;
+	    }
+	  list->bufarray[j].prev = NULL;
+	}
+      list->aout_lists[i].free_list = &(list->bufarray[prev]);
+      prev = prev + partition_size + distribute_remainder + inc;
+      inc = 0;
+    }
+
+  for (i = 0; i < list->num_lists; i++)
+    {
+      list->aout_lists[i].table = mht_create ("PGBUF_AOUT_HASH", list->max_count, pgbuf_hash_vpid, pgbuf_compare_vpid);
+
+      if (list->aout_lists[i].table == NULL)
 	{
 	  goto error_return;
 	}
+      pthread_mutex_init(&(list->aout_lists[i].list_mutex), NULL);
     }
 
   return NO_ERROR;
 
 error_return:
-  list->Aout_free = NULL;
   if (list->bufarray != NULL)
     {
       free_and_init (list->bufarray);
     }
-
-  if (list->aout_buf_ht == NULL)
+  
+  if (list->aout_lists != NULL)
     {
-      for (i = 0; list->aout_buf_ht[i] != NULL; i++)
+      for(i = 0;i < list->num_lists;i++)
 	{
-	  mht_destroy (list->aout_buf_ht[i]);
+	  list->aout_lists[i].free_list = NULL;
 	}
-      free_and_init (list->aout_buf_ht);
-    }
 
-  pthread_mutex_destroy (&list->Aout_mutex);
+      for (i = 0; list->aout_lists[i].table != NULL; i++)
+	{
+	  mht_destroy (list->aout_lists[i].table);
+	  pthread_mutex_destroy (&(list->aout_lists[i].list_mutex));
+	}
+      free_and_init (list->aout_lists);
+    }
 
   return ER_FAILED;
 #undef PGBUF_LIMIT_AOUT_BUFFERS
@@ -5977,7 +6007,7 @@ pgbuf_unlatch_bcb_upon_unfix (THREAD_ENTRY * thread_p, PGBUF_BCB * bufptr, int h
 	      break;
 
 	    case PGBUF_VOID_ZONE:
-	      if (!PGBUF_IS_2Q_ENABLED || pgbuf_remove_vpid_from_aout_list (thread_p, &bufptr->vpid))
+	      if (!PGBUF_IS_2Q_ENABLED || pgbuf_remove_vpid_from_aout_list (thread_p, &bufptr->vpid, bufptr->list_id))
 		{
 		  /* Put BCB in "middle" of LRU if VPID is in Aout list or is the first reference and 2Q is disabled.
 		   * The page is not yet hot. */
@@ -7767,6 +7797,8 @@ pgbuf_get_victim_from_ain_list (THREAD_ENTRY * thread_p, int max_count)
     }
   else
     {
+      int list_id;
+
       rv = pthread_mutex_lock (&ain_list->Ain_mutex);
       pgbuf_remove_from_ain_list (bufptr);
       ain_list->ain_count -= 1;
@@ -7777,7 +7809,8 @@ pgbuf_get_victim_from_ain_list (THREAD_ENTRY * thread_p, int max_count)
 
       /* Add vpid to AOUT list. We won't be able to do it when we actually victimize the page because we will not know
        * where the BCB came from. */
-      pgbuf_add_vpid_to_aout_list (thread_p, &bufptr->vpid);
+      list_id = pgbuf_add_vpid_to_aout_list (thread_p, &bufptr->vpid);
+      bufptr->list_id = list_id;
 
       return bufptr;
     }
@@ -8370,54 +8403,55 @@ pgbuf_remove_from_ain_list (PGBUF_BCB * bufptr)
  * thread_p (in) :
  * vpid (in) :
  */
-static void
+static int
 pgbuf_add_vpid_to_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid)
 {
 #if defined(SERVER_MODE)
   int rv;
 #endif /* SERVER_MODE */
-  PGBUF_AOUT_LIST *list;
+  PGBUF_AOUT_HT_LIST *list;
   PGBUF_AOUT_BUF *aout_buf;
   int hash_idx = 0;
+  UINT64 c_timestamp;
 
   if (pgbuf_Pool.buf_AOUT_list.max_count <= 0)
     {
       return;
     }
 
-  list = &pgbuf_Pool.buf_AOUT_list;
+  //Get the list into which to insert the next vpid
+  c_timestamp = ATOMIC_INC_64 (&pgbuf_Pool.buf_AOUT_list.cur_timestamp, 1);
+  list = &pgbuf_Pool.buf_AOUT_list.aout_lists[(c_timestamp - 1) % pgbuf_Pool.buf_AOUT_list.num_lists];
 
-  rv = pthread_mutex_lock (&pgbuf_Pool.buf_AOUT_list.Aout_mutex);
-
-  if (list->Aout_free == NULL)
+  rv = pthread_mutex_lock (&list->list_mutex);
+  if (list->free_list == NULL)
     {
       assert (list->Aout_bottom != NULL);
       /* disconnect the bottom */
       aout_buf = list->Aout_bottom;
-      if (list->Aout_bottom->prev == NULL)
+      if (list->Aout_bottom->next == NULL)
 	{
 	  assert (false);
 	}
-      list->Aout_bottom = list->Aout_bottom->prev;
-      list->Aout_bottom->next = NULL;
+      list->Aout_bottom = list->Aout_bottom->next;
+      list->Aout_bottom->prev = NULL;
 
       /* also remove entry from hash table */
-      hash_idx = AOUT_HASH_IDX (&aout_buf->vpid, list);
-      mht_rem (list->aout_buf_ht[hash_idx], &aout_buf->vpid, NULL, NULL);
+      mht_rem (list->table, &aout_buf->vpid, NULL, NULL);
     }
   else
     {
-      aout_buf = list->Aout_free;
-      list->Aout_free = list->Aout_free->next;
+      aout_buf = list->free_list;
+      list->free_list = list->free_list->next;
     }
 
   aout_buf->next = NULL;
   aout_buf->prev = NULL;
   VPID_COPY (&aout_buf->vpid, vpid);
+  aout_buf->timestamp = c_timestamp;
 
   /* add to hash */
-  hash_idx = AOUT_HASH_IDX (&aout_buf->vpid, list);
-  mht_put (list->aout_buf_ht[hash_idx], &aout_buf->vpid, aout_buf);
+  mht_put (list->table, &aout_buf->vpid, aout_buf);
 
   if (list->Aout_top == NULL)
     {
@@ -8432,13 +8466,13 @@ pgbuf_add_vpid_to_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid)
     }
   else
     {
-      aout_buf->next = list->Aout_top;
-      list->Aout_top->prev = aout_buf;
+      aout_buf->prev = list->Aout_top;
+      list->Aout_top->next = aout_buf;
       list->Aout_top = aout_buf;
     }
 
-  pthread_mutex_unlock (&pgbuf_Pool.buf_AOUT_list.Aout_mutex);
-
+  pthread_mutex_unlock (&list->list_mutex);
+  return (c_timestamp - 1) % pgbuf_Pool.buf_AOUT_list.num_lists;
 }
 
 /*
@@ -8447,25 +8481,25 @@ pgbuf_add_vpid_to_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid)
  * return : true if found, false otherwise
  * thread_p (in) :
  * vpid (in) :
+ * list_id (in) :
  */
 static bool
-pgbuf_remove_vpid_from_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid)
+pgbuf_remove_vpid_from_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid, const int list_id)
 {
 #if defined(SERVER_MODE)
   int rv;
 #endif /* SERVER_MODE */
   PGBUF_AOUT_BUF *aout_buf;
-  int hash_idx;
-
+  PGBUF_AOUT_HT_LIST* list;
+ 
   if (pgbuf_Pool.buf_AOUT_list.max_count <= 0)
     {
       /* Aout list not used */
       return false;
     }
 
-  hash_idx = AOUT_HASH_IDX (vpid, (&pgbuf_Pool.buf_AOUT_list));
-
-  aout_buf = mht_get (pgbuf_Pool.buf_AOUT_list.aout_buf_ht[hash_idx], vpid);
+  list = &pgbuf_Pool.buf_AOUT_list.aout_lists[list_id];
+  aout_buf = mht_get (list->table, vpid);
   if (aout_buf == NULL)
     {
       /* vpid not in Aout */
@@ -8474,15 +8508,15 @@ pgbuf_remove_vpid_from_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid)
 
   /* Remove it from Aout. We were optimistic and assumed we will not find it. Unfortunately, after we get exclusive
    * access to Aout list, we have to search for it again because somebody else might have thrown it out. */
-  rv = pthread_mutex_lock (&pgbuf_Pool.buf_AOUT_list.Aout_mutex);
+  rv = pthread_mutex_lock (&list->list_mutex);
   if (!VPID_EQ (&aout_buf->vpid, vpid))
     {
       /* Somebody else pushed our vpid out of the list. Search again */
-      aout_buf = mht_get (pgbuf_Pool.buf_AOUT_list.aout_buf_ht[hash_idx], vpid);
+      aout_buf = mht_get (list->table, vpid);
       if (aout_buf == NULL)
 	{
 	  /* Not there anymore, just return */
-	  pthread_mutex_unlock (&pgbuf_Pool.buf_AOUT_list.Aout_mutex);
+	  pthread_mutex_unlock (&list->list_mutex);
 	  return false;
 	}
     }
@@ -8491,24 +8525,24 @@ pgbuf_remove_vpid_from_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid)
    * The reason for this is that nobody can change it while we're holding the mutex. Any changes must be visible before 
    * we acquire this mutex */
 
-  if (aout_buf == pgbuf_Pool.buf_AOUT_list.Aout_bottom)
+  if (aout_buf == list->Aout_bottom)
     {
-      pgbuf_Pool.buf_AOUT_list.Aout_bottom = pgbuf_Pool.buf_AOUT_list.Aout_bottom->prev;
+      list->Aout_bottom = list->Aout_bottom->next;
 
-      if (pgbuf_Pool.buf_AOUT_list.Aout_bottom != NULL)
+      if (list->Aout_bottom != NULL)
 	{
-	  pgbuf_Pool.buf_AOUT_list.Aout_bottom->next = NULL;
+	  list->Aout_bottom->prev = NULL;
 	}
       aout_buf->prev = NULL;
     }
 
-  if (aout_buf == pgbuf_Pool.buf_AOUT_list.Aout_top)
+  if (aout_buf == list->Aout_top)
     {
-      pgbuf_Pool.buf_AOUT_list.Aout_top = pgbuf_Pool.buf_AOUT_list.Aout_top->next;
+      list->Aout_top = list->Aout_top->prev;
 
-      if (pgbuf_Pool.buf_AOUT_list.Aout_top != NULL)
+      if (list->Aout_top != NULL)
 	{
-	  pgbuf_Pool.buf_AOUT_list.Aout_top->prev = NULL;
+	  list->Aout_top->next = NULL;
 	}
       aout_buf->next = NULL;
     }
@@ -8523,17 +8557,17 @@ pgbuf_remove_vpid_from_aout_list (THREAD_ENTRY * thread_p, const VPID * vpid)
     }
 
   /* remove vpid from hash */
-  mht_rem (pgbuf_Pool.buf_AOUT_list.aout_buf_ht[hash_idx], vpid, NULL, NULL);
+  mht_rem (list->table, vpid, NULL, NULL);
 
   /* add to free list */
   VPID_SET_NULL (&aout_buf->vpid);
   aout_buf->next = NULL;
   aout_buf->prev = NULL;
 
-  aout_buf->next = pgbuf_Pool.buf_AOUT_list.Aout_free;
-  pgbuf_Pool.buf_AOUT_list.Aout_free = aout_buf;
+  aout_buf->next = list->free_list;
+  list->free_list = aout_buf;
 
-  pthread_mutex_unlock (&pgbuf_Pool.buf_AOUT_list.Aout_mutex);
+  pthread_mutex_unlock (&list->list_mutex);
 
   return true;
 }
